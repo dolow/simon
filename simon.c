@@ -4,9 +4,21 @@
 #define ROTATE_R(v, d) ((v >> d) | (v << (8 * sizeof(v) - d)))
 #define ROTATE_L(v, d) ((v << d) | (v >> (8 * sizeof(v) - d)))
 
-#define ROUNDS 32
+#define FIESTEL_ROTATE(v) ((ROTATE_L(v, 1) & ROTATE_L(v, 8)) ^ ROTATE_L(v, 2))
+
 #define BLOCK_SIZE 32
 #define WORDS 8
+
+#define CONSTANT_C 0xfffffffffffffffc
+
+
+// TODO: accept other sizes
+#define WORD_SIZE  64
+#define KEY_WORDS  4
+#define ROUNDS     72
+#define Z_VECTOR_J 4
+
+
 
 /**
  * What you see is whit is Simon :-)
@@ -36,33 +48,54 @@
  *
  */
 
+/**
+ * Z vector const
+ * https://eprint.iacr.org/2013/543.pdf (3 Differential Attack)
+ */
+const uint64_t Z_VECTOR[5][62] = {
+    {1,1,1,1,1,0,1,0,0,0,1,0,0,1,0,1,0,1,1,0,0,0,0,1,1,1,0,0,1,1,0,1,1,1,1,1,0,1,0,0,0,1,0,0,1,0,1,0,1,1,0,0,0,0,1,1,1,0,0,1,1,0},
+    {1,0,0,0,1,1,1,0,1,1,1,1,1,0,0,1,0,0,1,1,0,0,0,0,1,0,1,1,0,1,0,1,0,0,0,1,1,1,0,1,1,1,1,1,0,0,1,0,0,1,1,0,0,0,0,1,0,1,1,0,1,0},
+    {1,0,1,0,1,1,1,1,0,1,1,1,0,0,0,0,0,0,1,1,0,1,0,0,1,0,0,1,1,0,0,0,1,0,1,0,0,0,0,1,0,0,0,1,1,1,1,1,1,0,0,1,0,1,1,0,1,1,0,0,1,1},
+    {1,1,0,1,1,0,1,1,1,0,1,0,1,1,0,0,0,1,1,0,0,1,0,1,1,1,1,0,0,0,0,0,0,1,0,0,1,0,0,0,1,0,1,0,0,1,1,1,0,0,1,1,0,1,0,0,0,0,1,1,1,1},
+    {1,1,0,1,0,0,0,1,1,1,1,0,0,1,1,0,1,0,1,1,0,1,1,0,0,0,1,0,0,0,0,0,0,1,0,1,1,1,0,0,0,0,1,1,0,0,1,0,1,0,0,1,0,0,1,1,1,0,1,1,1,1}
+};
+
+/**
+ * key schedule formula
+ * https://eprint.iacr.org/2013/526.pdf (2 SIMON) 
+ *
+ * 4 key words:
+ *     Y = K[i + 1] ^ (K[i + 3] >> 3)
+ *     K[i + KEY_WORDS] = K[i] ^ Y ^ (Y >> 1) ^ CONSTANT_C ^ (z[j])[i]
+ * 3 - 1 key words:
+ *     Y = K[i + 1]
+ *     K[i + KEY_WORDS] = K[i] ^ Y ^ (Y >> 1) ^ CONSTANT_C ^ (z[j])[i]
+ */
+void key_schedule(uint64_t* key, uint64_t* dest)
+{
+    for (int i = 0; i < KEY_WORDS; i++)
+        dest[i] = key[i];
+    
+    for (int i = KEY_WORDS; i < ROUNDS; i++){
+        uint64_t y = ROTATE_R(dest[i - 1], 3);
+        if (KEY_WORDS == 4)
+            y ^= dest[i - 3];
+        dest[i] = dest[i - KEY_WORDS] ^ y ^ ROTATE_R(y, 1) ^ CONSTANT_C ^ Z_VECTOR[Z_VECTOR_J][(i - KEY_WORDS) % 62];
+    }
+}
 
 static inline void simon_round(uint64_t* pt1, uint64_t* pt2, uint64_t key)
 {
-    uint64_t s1 = ROTATE_L(*pt1, 1);
-    uint64_t s2 = ROTATE_L(*pt1, 8);
-    
-    *pt2 ^= ROTATE_L(*pt1, 2) ^ (s1 & s2);
-    
-    *pt2 ^= key;
-    
     uint64_t _pt1 = *pt1;
-    *pt1 = *pt2;
+    *pt1 = *pt2 ^ FIESTEL_ROTATE(*pt1) ^ key;
     *pt2 = _pt1;
 }
 
 static inline void simon_back(uint64_t* pt1, uint64_t* pt2, uint64_t key)
 {
     uint64_t _pt2 = *pt2;
-    *pt2 = *pt1;
+    *pt2 = *pt1 ^ FIESTEL_ROTATE(*pt2) ^ key;
     *pt1 = _pt2;
-    
-    *pt2 ^= key;
-    
-    uint64_t s1 = ROTATE_L(*pt1, 1);
-    uint64_t s2 = ROTATE_L(*pt1, 8);
-    
-    *pt2 ^= ROTATE_L(*pt1, 2) ^ (s1 & s2);
 }
 
 void simon_encrypt(const uint64_t pt[2], uint64_t ct[2], uint64_t key[ROUNDS])
@@ -171,34 +204,41 @@ static inline int simon_decrypt_all(const unsigned char* ct, unsigned char* pt, 
     return 0;
 }
 
-const char* test_key = "abcdefghijklmnopqrstuvwxyz123456";
-
 int main(int argc, const char** argv)
 {
-    int length = 64;
+    //uint64_t k[4] = {0x1f1e1d1c1b1a1918, 0x1716151413121110, 0x0f0e0d0c0b0a0908, 0x0706050403020100};
+    uint64_t k[4] = {0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x1f1e1d1c1b1a1918};
+    uint64_t sk[72];
+    
+    uint64_t p[2] = {0x74206e69206d6f6f, 0x6d69732061207369};
+    uint64_t c[2];
+    uint64_t d[2];
+    
+    uint64_t expect[2] = {0x8d2b5579afc8a3a0, 0x3bf72a87efe7b868};
 
-    unsigned char pt[64] = {
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
-        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
-        0x31, 0x32, 0x33, 0x34, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B
-    };
-    //const char pt[32] = "hello world!1234567890ABCDEFGHIJ";
-    unsigned char ct[64];
-    unsigned char dt[64];
     
-    for (int i = 0; i < length; i++) printf("%03u ", pt[i]);
-    printf("\n");
+    key_schedule(k, sk);
     
-    simon_encrypt_all(pt, ct, (uint64_t*)test_key, length);
+    printf("%llu %llu \n", p[0], p[1]);
     
-    for (int i = 0; i < length; i++) printf("%03u ", ct[i]);
-    printf("\n");
+    simon_encrypt(p, c, sk);
     
-    simon_decrypt_all(ct, dt, (uint64_t*)test_key, length);
+    printf("%llu %llu \n", c[0], c[1]);
     
-    for (int i = 0; i < length; i++) printf("%03u ", dt[i]);
-    printf("\n");
+    if (c[0] == expect[0] && c[1] == expect[1])
+        printf("algorithm passed\n");
+    else
+        printf("algorithm failed\n");
     
+    simon_decrypt(c, d, sk);
+    
+    printf("%llu %llu \n", d[0], d[1]);
+
+    if (p[0] == d[0] && p[1] == d[1])
+        printf("round trip succeeded\n");
+    else
+        printf("round trip failed\n");
+    
+
     return 0;
 }
